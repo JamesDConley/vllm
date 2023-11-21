@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from packaging import version
 
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -56,7 +56,7 @@ def create_error_response(status_code: HTTPStatus,
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):  # pylint: disable=unused-argument
+async def validation_exception_handler(_, exc):
     return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
 
 
@@ -133,10 +133,8 @@ async def check_length(
     assert (not (prompt is None and prompt_ids is None)
             and not (prompt is not None and prompt_ids is not None)
             ), "Either prompt or prompt_ids should be provided."
-    if prompt_ids is not None:
-        input_ids = prompt_ids
-    else:
-        input_ids = tokenizer(prompt).input_ids
+    input_ids = prompt_ids if prompt_ids is not None else tokenizer(
+        prompt).input_ids
     token_num = len(input_ids)
 
     if request.max_tokens is None:
@@ -152,6 +150,12 @@ async def check_length(
         )
     else:
         return input_ids, None
+
+
+@app.get("/health")
+async def health() -> Response:
+    """Health check."""
+    return Response(status_code=200)
 
 
 @app.get("/v1/models")
@@ -221,6 +225,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
     request_id = f"cmpl-{random_uuid()}"
     created_time = int(time.monotonic())
     try:
+        spaces_between_special_tokens = request.spaces_between_special_tokens
         sampling_params = SamplingParams(
             n=request.n,
             presence_penalty=request.presence_penalty,
@@ -235,6 +240,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
             ignore_eos=request.ignore_eos,
             use_beam_search=request.use_beam_search,
             skip_special_tokens=request.skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -246,6 +252,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
         index: int,
         text: str,
         finish_reason: Optional[str] = None,
+        usage: Optional[UsageInfo] = None,
     ) -> str:
         choice_data = ChatCompletionResponseStreamChoice(
             index=index,
@@ -258,7 +265,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
             model=model_name,
             choices=[choice_data],
         )
-        response_json = response.json(ensure_ascii=False)
+        if usage is not None:
+            response.usage = usage
+        # exclude unset to leave details out of each sse
+        response_json = response.json(exclude_unset=True, ensure_ascii=False)
 
         return response_json
 
@@ -284,17 +294,25 @@ async def create_chat_completion(request: ChatCompletionRequest,
                 i = output.index
                 delta_text = output.text[len(previous_texts[i]):]
                 previous_texts[i] = output.text
-                previous_num_tokens[i] = len(output.token_ids)
+                completion_tokens = len(output.token_ids)
+                previous_num_tokens[i] = completion_tokens
                 response_json = create_stream_response_json(
                     index=i,
                     text=delta_text,
                 )
                 yield f"data: {response_json}\n\n"
                 if output.finish_reason is not None:
+                    prompt_tokens = len(res.prompt_token_ids)
+                    final_usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
                     response_json = create_stream_response_json(
                         index=i,
                         text="",
                         finish_reason=output.finish_reason,
+                        usage=final_usage,
                     )
                     yield f"data: {response_json}\n\n"
         yield "data: [DONE]\n\n"
@@ -422,6 +440,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     created_time = int(time.monotonic())
     try:
+        spaces_between_special_tokens = request.spaces_between_special_tokens
         sampling_params = SamplingParams(
             n=request.n,
             best_of=request.best_of,
@@ -437,6 +456,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             logprobs=request.logprobs,
             use_beam_search=request.use_beam_search,
             skip_special_tokens=request.skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
         )
     except ValueError as e:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(e))
@@ -461,6 +481,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         text: str,
         logprobs: Optional[LogProbs] = None,
         finish_reason: Optional[str] = None,
+        usage: Optional[UsageInfo] = None,
     ) -> str:
         choice_data = CompletionResponseStreamChoice(
             index=index,
@@ -474,7 +495,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             model=model_name,
             choices=[choice_data],
         )
-        response_json = response.json(ensure_ascii=False)
+        if usage is not None:
+            response.usage = usage
+        response_json = response.json(exclude_unset=True, ensure_ascii=False)
 
         return response_json
 
@@ -504,11 +527,19 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 if output.finish_reason is not None:
                     logprobs = (LogProbs()
                                 if request.logprobs is not None else None)
+                    prompt_tokens = len(res.prompt_token_ids)
+                    completion_tokens = len(output.token_ids)
+                    final_usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
                     response_json = create_stream_response_json(
                         index=i,
                         text="",
                         logprobs=logprobs,
                         finish_reason=output.finish_reason,
+                        usage=final_usage,
                     )
                     yield f"data: {response_json}\n\n"
         yield "data: [DONE]\n\n"
@@ -633,9 +664,10 @@ if __name__ == "__main__":
     max_model_len = engine_model_config.max_model_len
 
     # A separate tokenizer to map token IDs to strings.
-    tokenizer = get_tokenizer(engine_args.tokenizer,
-                              tokenizer_mode=engine_args.tokenizer_mode,
-                              trust_remote_code=engine_args.trust_remote_code)
+    tokenizer = get_tokenizer(
+        engine_model_config.tokenizer,
+        tokenizer_mode=engine_model_config.tokenizer_mode,
+        trust_remote_code=engine_model_config.trust_remote_code)
 
     uvicorn.run(app,
                 host=args.host,
